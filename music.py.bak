@@ -1,0 +1,312 @@
+import asyncio
+import inspect
+from pathlib import Path
+from telegram.request import HTTPXRequest
+from config import API_ID, API_HASH, BOT_TOKEN
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from pytgcalls import PyTgCalls
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+BASE = Path(__file__).resolve().parent
+AUDIO = BASE / "audio"
+AUDIO.mkdir(exist_ok=True)
+
+EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"}
+
+user_client = None
+calls = None
+current = {}
+queues = {}
+
+
+async def invoke(method, *args, **kwargs):
+    result = method(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def startup(application):
+    global user_client, calls
+
+    session = (BASE / "session.txt").read_text().strip()
+    user_client = TelegramClient(
+        StringSession(session), API_ID, API_HASH
+    )
+
+    await user_client.connect()
+
+    if not await user_client.is_user_authorized():
+        raise RuntimeError("Telegram session is not authorized.")
+
+    calls = PyTgCalls(user_client)
+    await invoke(calls.start)
+
+    print("UserBot connected.")
+    print("Music Bot started.")
+
+
+async def shutdown(application):
+    global calls, user_client
+
+    if calls:
+        stop_method = getattr(calls, "stop", None)
+        if stop_method:
+            try:
+                await invoke(stop_method)
+            except Exception as exc:
+                print("Call shutdown warning:", type(exc).__name__)
+
+    if user_client and user_client.is_connected():
+        await user_client.disconnect()
+
+
+async def allowed(update, context):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or chat.type not in ("group", "supergroup"):
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "ဒီ command ကို Group ထဲမှာ အသုံးပြုပါ။"
+            )
+        return False
+
+    if not user:
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await update.effective_message.reply_text(
+                "ဒီ command ကို Group Admin တွေပဲ အသုံးပြုနိုင်ပါတယ်။"
+            )
+            return False
+    except Exception:
+        await update.effective_message.reply_text(
+            "Admin ခွင့်စစ်မရပါ။ Bot ကို Group Admin ပေးပြီး ပြန်စမ်းပါ။"
+        )
+        return False
+
+    return True
+
+
+def get_track(filename):
+    name = Path(filename).name
+    if not name or name != filename or name in (".", ".."):
+        return None
+
+    path = AUDIO / name
+    if path.is_file() and path.suffix.lower() in EXTENSIONS:
+        return path
+
+    return None
+
+
+def list_tracks():
+    return sorted(
+        p.name for p in AUDIO.iterdir()
+        if p.is_file() and p.suffix.lower() in EXTENSIONS
+    )
+
+
+async def play_next(chat_id):
+    queue = queues.setdefault(chat_id, [])
+
+    if not queue:
+        current.pop(chat_id, None)
+        await invoke(calls.leave_call, chat_id)
+        return None
+
+    track = queue.pop(0)
+    await invoke(calls.play, chat_id, str(track))
+    current[chat_id] = track
+    return track
+
+
+async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await allowed(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        tracks = list_tracks()
+        message = (
+            "သီချင်းဖိုင်များ:\n" + "\n".join(tracks)
+            if tracks else "audio folder ထဲမှာ သီချင်းဖိုင် မရှိသေးပါ။"
+        )
+        await update.effective_message.reply_text(message)
+        return
+
+    track = get_track(" ".join(context.args))
+    if not track:
+        await update.effective_message.reply_text(
+            "ဖိုင်မတွေ့ပါ။ /play song.mp3 လို့သုံးပါ။\n"
+            "ဖိုင်ကို ~/music/audio/ ထဲမှာ ထည့်ထားပါ။"
+        )
+        return
+
+    if chat_id in current:
+        queues.setdefault(chat_id, []).append(track)
+        await update.effective_message.reply_text(
+            f"Queue ထဲထည့်ပြီးပါပြီ: {track.name}"
+        )
+        return
+
+    try:
+        await invoke(calls.play, chat_id, str(track))
+        current[chat_id] = track
+        await update.effective_message.reply_text(
+            f"ဖွင့်နေပါပြီ: {track.name}"
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(
+            f"ဖွင့်မရပါ: {type(exc).__name__}: {exc}"
+        )
+
+
+async def pause_cmd(update, context):
+    if not await allowed(update, context):
+        return
+
+    try:
+        ok = await invoke(calls.pause, update.effective_chat.id)
+        await update.effective_message.reply_text(
+            "ခဏရပ်ထားပါပြီ။" if ok else "Pause မလုပ်နိုင်ပါ။"
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(
+            f"Pause error: {type(exc).__name__}"
+        )
+
+
+async def resume_cmd(update, context):
+    if not await allowed(update, context):
+        return
+
+    try:
+        ok = await invoke(calls.resume, update.effective_chat.id)
+        await update.effective_message.reply_text(
+            "ပြန်ဖွင့်ပါပြီ။" if ok else "Resume မလုပ်နိုင်ပါ။"
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(
+            f"Resume error: {type(exc).__name__}"
+        )
+
+
+async def skip_cmd(update, context):
+    if not await allowed(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+
+    try:
+        next_track = await play_next(chat_id)
+        await update.effective_message.reply_text(
+            f"နောက်တစ်ပုဒ်: {next_track.name}"
+            if next_track else "Queue ကုန်သွားပါပြီ။"
+        )
+    except Exception as exc:
+        current.pop(chat_id, None)
+        await update.effective_message.reply_text(
+            f"Skip error: {type(exc).__name__}: {exc}"
+        )
+
+
+async def stop_cmd(update, context):
+    if not await allowed(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    queues.pop(chat_id, None)
+    current.pop(chat_id, None)
+
+    try:
+        await invoke(calls.leave_call, chat_id)
+        await update.effective_message.reply_text(
+            "သီချင်းရပ်ပြီး Voice Chat က ထွက်လိုက်ပါပြီ။"
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(
+            f"Stop error: {type(exc).__name__}: {exc}"
+        )
+
+
+async def queue_cmd(update, context):
+    if not await allowed(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    lines = []
+
+    if chat_id in current:
+        lines.append(f"ဖွင့်ထားသောဖိုင်: {current[chat_id].name}")
+
+    for index, track in enumerate(queues.get(chat_id, []), 1):
+        lines.append(f"{index}. {track.name}")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines) if lines else "Queue မရှိသေးပါ။"
+    )
+
+
+async def start_cmd(update, context):
+    await update.effective_message.reply_text(
+        "Music Bot အသင့်ဖြစ်ပါပြီ။\n\n"
+        "/play song.mp3 - ဖွင့်ရန်\n"
+        "/pause - ခဏရပ်ရန်\n"
+        "/resume - ပြန်ဖွင့်ရန်\n"
+        "/skip - နောက်တစ်ပုဒ်\n"
+        "/stop - ရပ်ရန်\n"
+        "/queue - Queue ကြည့်ရန်"
+    )
+
+
+
+def main():
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    updates_request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(updates_request)
+        .post_init(startup)
+        .post_shutdown(shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("play", play_cmd))
+    app.add_handler(CommandHandler("pause", pause_cmd))
+    app.add_handler(CommandHandler("resume", resume_cmd))
+    app.add_handler(CommandHandler("skip", skip_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("queue", queue_cmd))
+
+    print("Starting Music Bot...")
+    app.run_polling(bootstrap_retries=5)
+
+
+if __name__ == "__main__":
+    main()
